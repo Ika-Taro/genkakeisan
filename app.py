@@ -14,39 +14,35 @@ st.title("原価計算・売価設定アプリ")
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
     
-    # --- 1. 材料データの読み込み ---
-    df = conn.read(worksheet="Sheet1", usecols=list(range(6)), ttl=0)
+    # 修正ポイント1：ttl="10m"（10分キャッシュ）にしてAPI制限を回避
+    df = conn.read(worksheet="Sheet1", usecols=list(range(6)), ttl="10m")
     df = df.dropna(how="all").dropna(subset=["商品名"]) 
     df["商品名"] = df["商品名"].astype(str) 
     
-    # 数値列の徹底クリーニング
     for col in ["仕入価格", "内容量", "g/ml単価"]:
         if col in df.columns:
-            # 文字列が含まれていても数値のみ抽出し、ダメなら0にする
             df[col] = pd.to_numeric(df[col].astype(str).replace(r'[^0-9.]', '', regex=True), errors='coerce').fillna(0)
 
     if not df.empty and "URL" in df.columns:
         cols = [c for c in df.columns if c != "URL"] + ["URL"]
         df = df[cols]
     
-    # --- 2. レシピデータの読み込み ---
     try:
-        df_recipes = conn.read(worksheet="Recipes", usecols=list(range(5)), ttl=0)
+        # 修正ポイント1：こちらも ttl="10m" に変更
+        df_recipes = conn.read(worksheet="Recipes", usecols=list(range(5)), ttl="10m")
         df_recipes = df_recipes.dropna(how="all").dropna(subset=["レシピ名"])
         
-        # 数値列のエラー回避処理
         for col in ["合計原価", "推奨売価"]:
             if col in df_recipes.columns:
-                # 「1,000円」のような表記も数値の「1000」に変換
                 df_recipes[col] = pd.to_numeric(df_recipes[col].astype(str).replace(r'[^0-9.]', '', regex=True), errors='coerce').fillna(0)
         
         df_recipes["レシピ名"] = df_recipes["レシピ名"].astype(str)
-        df_recipes["利益率"] = df_recipes["利益率"].astype(str) # 利益率は%を含むため文字列として扱う
+        df_recipes["利益率"] = df_recipes["利益率"].astype(str)
     except Exception:
         df_recipes = pd.DataFrame(columns=["レシピ名", "使用材料", "合計原価", "利益率", "推奨売価"])
         
 except Exception as e:
-    st.error(f"データの読み込みに失敗しました。スプレッドシートを確認してください: {e}")
+    st.error(f"データの読み込みに失敗しました。時間をおいて再度お試しください: {e}")
     df = pd.DataFrame(columns=["商品名", "仕入価格", "内容量", "単位", "g/ml単価", "URL"])
     df_recipes = pd.DataFrame(columns=["レシピ名", "使用材料", "合計原価", "利益率", "推奨売価"])
 
@@ -59,10 +55,10 @@ def fetch_product_info(url):
     except Exception:
         return ""
 
-# セッション管理
 if "fetched_name" not in st.session_state: st.session_state.fetched_name = ""
 if "recipe_items" not in st.session_state: st.session_state.recipe_items = []
 if "recipe_amounts" not in st.session_state: st.session_state.recipe_amounts = {}
+if "current_recipe_name" not in st.session_state: st.session_state.current_recipe_name = ""
 
 # --- タブ ---
 tab1, tab2, tab3 = st.tabs(["🛒 材料の登録・編集", "💰 原価計算・呼び戻し", "📋 レシピの確認・編集"])
@@ -91,17 +87,10 @@ with tab1:
         capacity = st.number_input("内容量", min_value=0.0, step=1.0)
         unit = st.selectbox("単位", ["g", "ml", "個"])
         
-        submitted = st.form_submit_button("新しく保存する")
-        
-        if submitted and name and price > 0 and capacity > 0:
+        if st.form_submit_button("新しく保存する") and name and price > 0 and capacity > 0:
             unit_price = price / capacity
             new_data = pd.DataFrame([{
-                "商品名": name,
-                "仕入価格": price,
-                "内容量": capacity,
-                "単位": unit,
-                "g/ml単価": round(unit_price, 2),
-                "URL": url_input
+                "商品名": name, "仕入価格": price, "内容量": capacity, "単位": unit, "g/ml単価": round(unit_price, 2), "URL": url_input
             }])
             updated_df = pd.concat([df, new_data], ignore_index=True)
             conn.update(worksheet="Sheet1", data=updated_df)
@@ -122,10 +111,7 @@ with tab1:
             "g/ml単価": st.column_config.NumberColumn("単価", width="small", disabled=True),
             "URL": st.column_config.TextColumn("URL", width="small")
         },
-        hide_index=True,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="edit_ingredients"
+        hide_index=True, num_rows="dynamic", use_container_width=True, key="edit_ingredients"
     )
     if st.button("材料の変更を保存"):
         conn.update(worksheet="Sheet1", data=edited_df)
@@ -156,8 +142,10 @@ with tab2:
                             items.append(item_name)
                             amounts[item_name] = amount
                     st.session_state.recipe_items, st.session_state.recipe_amounts = items, amounts
+                    st.session_state.current_recipe_name = recipe_to_load
             else:
                 st.session_state.recipe_items, st.session_state.recipe_amounts = [], {}
+                st.session_state.current_recipe_name = ""
             st.rerun()
 
     st.markdown("---")
@@ -185,19 +173,31 @@ with tab2:
                 st.success(f"推奨売価: **{int(target_price)} 円**")
                 
                 with st.form("save_recipe_form", clear_on_submit=True):
-                    recipe_name = st.text_input("レシピ名を入力して保存")
+                    recipe_name = st.text_input("レシピ名を入力して保存", value=st.session_state.current_recipe_name)
                     if st.form_submit_button("保存する") and recipe_name:
-                        new_recipe = pd.DataFrame([{
-                            "レシピ名": recipe_name,
-                            "使用材料": ", ".join([f"{k}({v})" for k, v in used_amounts.items()]),
-                            "合計原価": round(total_cost, 2),
-                            "利益率": f"{margin}%",
-                            "推奨売価": int(target_price)
-                        }])
-                        updated_recipes = pd.concat([df_recipes, new_recipe], ignore_index=True)
+                        ingredients_str = ", ".join([f"{k}({v})" for k, v in used_amounts.items()])
+                        
+                        # 修正ポイント2：同じ名前が存在する場合は「上書き」する処理
+                        if recipe_name in df_recipes["レシピ名"].values:
+                            idx = df_recipes[df_recipes["レシピ名"] == recipe_name].index[0]
+                            df_recipes.loc[idx, "使用材料"] = ingredients_str
+                            df_recipes.loc[idx, "合計原価"] = round(total_cost, 2)
+                            df_recipes.loc[idx, "利益率"] = f"{margin}%"
+                            df_recipes.loc[idx, "推奨売価"] = int(target_price)
+                            updated_recipes = df_recipes
+                        else:
+                            new_recipe = pd.DataFrame([{
+                                "レシピ名": recipe_name,
+                                "使用材料": ingredients_str,
+                                "合計原価": round(total_cost, 2),
+                                "利益率": f"{margin}%",
+                                "推奨売価": int(target_price)
+                            }])
+                            updated_recipes = pd.concat([df_recipes, new_recipe], ignore_index=True)
+                            
                         conn.update(worksheet="Recipes", data=updated_recipes)
                         st.cache_data.clear()
-                        st.success("保存しました！")
+                        st.success(f"「{recipe_name}」を保存しました！")
                         st.rerun()
 
 # ==========================================
@@ -208,9 +208,7 @@ with tab3:
     if df_recipes.empty:
         st.info("まだ保存されたレシピはありません。")
     else:
-        # エラー対策：全ての列を一度文字列に変換してからエディタに渡す
         display_recipes = df_recipes.copy()
-        
         edited_recipes = st.data_editor(
             display_recipes,
             column_config={
@@ -220,10 +218,7 @@ with tab3:
                 "利益率": st.column_config.TextColumn("利益率", width="small"),
                 "推奨売価": st.column_config.NumberColumn("売価", width="small"),
             },
-            hide_index=True,
-            num_rows="dynamic",
-            use_container_width=True,
-            key="edit_recipes"
+            hide_index=True, num_rows="dynamic", use_container_width=True, key="edit_recipes"
         )
         if st.button("レシピの変更を保存"):
             conn.update(worksheet="Recipes", data=edited_recipes)
