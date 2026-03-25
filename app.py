@@ -11,7 +11,8 @@ st.title("原価計算・売価設定アプリ")
 # ==========================================
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
-    df = conn.read(worksheet="Sheet1", usecols=list(range(6)))
+    # 修正ポイント1: ttl=0 を追加し、キャッシュを無効化して常に最新を読み込む
+    df = conn.read(worksheet="Sheet1", usecols=list(range(6)), ttl=0)
     
     df = df.dropna(how="all") 
     df = df.dropna(subset=["商品名"]) 
@@ -31,7 +32,6 @@ def fetch_product_info(url):
     except Exception as e:
         return ""
 
-# セッションステートの初期化（入力内容の勝手な上書きを防止）
 if "fetched_name" not in st.session_state:
     st.session_state.fetched_name = ""
 
@@ -44,7 +44,6 @@ tab1, tab2 = st.tabs(["🛒 材料の登録", "💰 原価計算・売価設定"
 with tab1:
     st.header("新しい材料を登録")
     
-    # 修正ポイント：情報取得をボタン式に変更し、フォームと分離する
     url_input = st.text_input("商品のURL（任意）")
     
     if st.button("URLから商品名を自動取得"):
@@ -60,7 +59,6 @@ with tab1:
             st.warning("URLを入力してください。")
 
     with st.form("add_ingredient_form"):
-        # 取得したデータを初期値として入れるが、手入力後の上書きはしない
         name = st.text_input("商品名", value=st.session_state.fetched_name)
         price = st.number_input("仕入価格（円）", min_value=1, step=10)
         capacity = st.number_input("内容量", min_value=1.0, step=10.0)
@@ -79,7 +77,6 @@ with tab1:
                 "g/ml単価": round(unit_price, 2)
             }])
             
-            # 列の順番を強制的に揃える（スプレッドシート側の列ズレ防止）
             new_data = new_data[["商品名", "URL", "仕入価格", "内容量", "単位", "g/ml単価"]]
             
             updated_df = pd.concat([df, new_data], ignore_index=True)
@@ -87,7 +84,8 @@ with tab1:
             
             st.success(f"「{name}」をスプレッドシートに保存しました！")
             
-            # 保存完了後に商品名の一時データをリセットする
+            # 修正ポイント2: 保存直後に古いキャッシュを強制消去する
+            st.cache_data.clear()
             st.session_state.fetched_name = ""
             st.rerun()
 
