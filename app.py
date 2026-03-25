@@ -18,7 +18,6 @@ try:
     df = df.dropna(how="all").dropna(subset=["商品名"]) 
     df["商品名"] = df["商品名"].astype(str) 
     
-    # 型の安全性を確保（数字列が文字列になっていた場合の対策）
     for col in ["仕入価格", "内容量", "g/ml単価"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -32,10 +31,8 @@ try:
         df_recipes = conn.read(worksheet="Recipes", usecols=list(range(5)), ttl=0)
         df_recipes = df_recipes.dropna(how="all").dropna(subset=["レシピ名"])
         
-        # 【重要】エラー対策：数字列を強制的に数値型に変換
         for col in ["合計原価", "推奨売価"]:
             if col in df_recipes.columns:
-                # 文字列が入っていても強制的に数字にし、無理なものは0にする
                 df_recipes[col] = pd.to_numeric(df_recipes[col], errors='coerce').fillna(0)
         
         df_recipes["レシピ名"] = df_recipes["レシピ名"].astype(str)
@@ -200,4 +197,54 @@ with tab2:
             
             if total_cost > 0:
                 target_price = total_cost / (1 - (margin / 100))
-                st.success(f"推奨売価: **{int(target_price)}
+                # ↓ここがエラーの箇所でした。修正済みです。
+                st.success(f"推奨売価: **{int(target_price)} 円**")
+                
+                with st.form("save_recipe_form", clear_on_submit=True):
+                    recipe_name = st.text_input("レシピ名を入力して保存")
+                    save_recipe_btn = st.form_submit_button("保存する")
+                    
+                    if save_recipe_btn and recipe_name:
+                        ingredients_str = ", ".join([f"{k}({v})" for k, v in used_amounts.items()])
+                        new_recipe = pd.DataFrame([{
+                            "レシピ名": recipe_name,
+                            "使用材料": ingredients_str,
+                            "合計原価": round(total_cost, 2),
+                            "利益率": f"{margin}%",
+                            "推奨売価": int(target_price)
+                        }])
+                        updated_recipes = pd.concat([df_recipes, new_recipe], ignore_index=True)
+                        conn.update(worksheet="Recipes", data=updated_recipes)
+                        st.cache_data.clear()
+                        st.success("保存しました！")
+                        st.rerun()
+
+# ==========================================
+# タブ3: レシピの確認と編集
+# ==========================================
+with tab3:
+    st.header("保存済みのレシピの編集・削除")
+    
+    if df_recipes.empty:
+        st.info("まだ保存されたレシピはありません。")
+    else:
+        edited_recipes = st.data_editor(
+            df_recipes,
+            column_config={
+                "レシピ名": st.column_config.TextColumn("レシピ名", width="medium"),
+                "使用材料": st.column_config.TextColumn("材料", width="medium"),
+                "合計原価": st.column_config.NumberColumn("原価", width="small"),
+                "利益率": st.column_config.TextColumn("利益率", width="small"),
+                "推奨売価": st.column_config.NumberColumn("売価", width="small"),
+            },
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="edit_recipes"
+        )
+        
+        if st.button("レシピの変更を保存"):
+            conn.update(worksheet="Recipes", data=edited_recipes)
+            st.cache_data.clear()
+            st.success("保存しました！")
+            st.rerun()
