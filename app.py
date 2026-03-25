@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from streamlit_gsheets import GSheetsConnection
+import re
 
 st.title("原価計算・売価設定アプリ")
 
@@ -12,15 +13,14 @@ st.title("原価計算・売価設定アプリ")
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
     
-    # 1. 材料データの読み込み (Sheet1)
     df = conn.read(worksheet="Sheet1", usecols=list(range(6)), ttl=0)
     df = df.dropna(how="all").dropna(subset=["商品名"]) 
     df["商品名"] = df["商品名"].astype(str) 
     
-    # 2. レシピデータの読み込み (Recipes)
     try:
         df_recipes = conn.read(worksheet="Recipes", usecols=list(range(5)), ttl=0)
         df_recipes = df_recipes.dropna(how="all").dropna(subset=["レシピ名"])
+        df_recipes["レシピ名"] = df_recipes["レシピ名"].astype(str)
     except Exception:
         df_recipes = pd.DataFrame(columns=["レシピ名", "使用材料", "合計原価", "利益率", "推奨売価"])
         
@@ -34,23 +34,28 @@ def fetch_product_info(url):
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, timeout=5)
         soup = BeautifulSoup(response.content, "html.parser")
-        title = soup.title.string.strip() if soup.title else ""
-        return title
-    except Exception as e:
+        return soup.title.string.strip() if soup.title else ""
+    except Exception:
         return ""
 
+# セッションステートの初期化（データ保持用）
 if "fetched_name" not in st.session_state:
     st.session_state.fetched_name = ""
+if "recipe_items" not in st.session_state:
+    st.session_state.recipe_items = []
+if "recipe_amounts" not in st.session_state:
+    st.session_state.recipe_amounts = {}
 
-# --- タブを3つに変更 ---
-tab1, tab2, tab3 = st.tabs(["🛒 材料の登録", "💰 原価計算", "📋 レシピ一覧"])
+# --- タブ ---
+tab1, tab2, tab3 = st.tabs(["🛒 材料の登録・編集", "💰 原価計算・呼び戻し", "📋 レシピの確認・編集"])
 
 # ==========================================
-# タブ1: 材料の登録と保存
+# タブ1: 材料の登録と編集
 # ==========================================
 with tab1:
     st.header("新しい材料を登録")
-    url_input = st.text_input("商品のURL（任意）")
+    
+    url_input = st.text_input("商品のURL（任意）", key="url_input_field")
     
     if st.button("URLから商品名を自動取得"):
         if url_input:
@@ -58,21 +63,22 @@ with tab1:
                 title = fetch_product_info(url_input)
                 if title:
                     st.session_state.fetched_name = title
-                    st.success("取得しました！下の入力欄に反映しています（自由に修正可能です）。")
+                    st.success("取得しました！下の入力欄に反映しています。")
                 else:
-                    st.warning("取得に失敗しました。下の欄に手動で入力してください。")
+                    st.warning("取得に失敗しました。手動で入力してください。")
         else:
             st.warning("URLを入力してください。")
 
-    with st.form("add_ingredient_form"):
+    # clear_on_submit=True で保存完了時に枠内を空にする
+    with st.form("add_ingredient_form", clear_on_submit=True):
         name = st.text_input("商品名", value=st.session_state.fetched_name)
-        price = st.number_input("仕入価格（円）", min_value=1, step=10)
-        capacity = st.number_input("内容量", min_value=1.0, step=10.0)
+        price = st.number_input("仕入価格（円）", min_value=0, step=10)
+        capacity = st.number_input("内容量", min_value=0.0, step=10.0)
         unit = st.selectbox("単位", ["g", "ml", "個"])
         
-        submitted = st.form_submit_button("スプレッドシートに保存する")
+        submitted = st.form_submit_button("新しく保存する")
         
-        if submitted and name and price and capacity:
+        if submitted and name and price > 0 and capacity > 0:
             unit_price = price / capacity
             new_data = pd.DataFrame([{
                 "商品名": name,
@@ -89,10 +95,21 @@ with tab1:
             
             st.cache_data.clear()
             st.session_state.fetched_name = ""
+            st.success(f"「{name}」を保存しました！")
             st.rerun()
 
-    st.subheader("保存済みの材料一覧")
-    st.dataframe(df)
+    st.markdown("---")
+    st.header("保存済みの材料の編集・削除")
+    st.write("表を直接クリックして文字や数字を書き換えられます。行の左端を選んで「Delete」キーで削除も可能です。")
+    
+    # st.data_editor で直接編集可能にする
+    edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="edit_ingredients")
+    
+    if st.button("材料の変更をスプレッドシートに上書き保存する"):
+        conn.update(worksheet="Sheet1", data=edited_df)
+        st.cache_data.clear()
+        st.success("材料の変更を保存しました！")
+        st.rerun()
 
 # ==========================================
 # タブ2: 原価計算と売価設定
@@ -100,13 +117,42 @@ with tab1:
 with tab2:
     st.header("レシピの原価計算")
     
+    # 呼び戻し機能
+    st.subheader("保存済みレシピの呼び戻し")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        recipe_to_load = st.selectbox("呼び出すレシピを選択", ["（新規作成）"] + df_recipes["レシピ名"].tolist())
+    with col2:
+        if st.button("展開する", use_container_width=True):
+            if recipe_to_load != "（新規作成）":
+                ingredients_str = df_recipes[df_recipes["レシピ名"] == recipe_to_load].iloc[0]["使用材料"]
+                items = []
+                amounts = {}
+                for item_str in ingredients_str.split(", "):
+                    match = re.search(r"(.*?)\(([\d\.]+)[^\d\.]*\)", item_str)
+                    if match:
+                        item_name = match.group(1).strip()
+                        amount = float(match.group(2))
+                        items.append(item_name)
+                        amounts[item_name] = amount
+                st.session_state.recipe_items = items
+                st.session_state.recipe_amounts = amounts
+            else:
+                st.session_state.recipe_items = []
+                st.session_state.recipe_amounts = {}
+            st.rerun()
+
+    st.markdown("---")
+    
     if df.empty:
-        st.info("まずは「材料の登録」タブから材料を追加してください。")
+        st.info("まずは材料を追加してください。")
     else:
-        selected_items = st.multiselect("使用する材料を選んでください", df["商品名"].tolist())
+        # 呼び戻したアイテムを初期選択状態にする
+        default_items = [item for item in st.session_state.recipe_items if item in df["商品名"].tolist()]
+        selected_items = st.multiselect("使用する材料を選んでください", options=df["商品名"].tolist(), default=default_items)
         
         total_cost = 0.0
-        used_amounts = {} # 使用量を記録するための辞書
+        used_amounts = {}
         
         if selected_items:
             st.write("各材料の使用量を入力してください：")
@@ -115,7 +161,10 @@ with tab2:
                 
                 if not filtered_df.empty:
                     item_data = filtered_df.iloc[0]
-                    amount = st.number_input(f"{item} ({item_data['単位']})", min_value=0.0, step=1.0, key=f"amount_{item}")
+                    # 呼び戻した分量を初期値にする
+                    default_amount = float(st.session_state.recipe_amounts.get(item, 0.0))
+                    
+                    amount = st.number_input(f"{item} ({item_data['単位']})", min_value=0.0, step=1.0, value=default_amount, key=f"amount_{item}")
                     
                     if amount > 0:
                         used_amounts[item] = f"{amount}{item_data['単位']}"
@@ -135,13 +184,12 @@ with tab2:
                 target_price = total_cost / (1 - (margin / 100))
                 st.success(f"利益率 {margin}% を確保するための推奨売価: **{int(target_price)} 円**")
                 
-                # 計算結果を保存するフォーム
-                with st.form("save_recipe_form"):
-                    recipe_name = st.text_input("レシピ名を入力して保存", placeholder="例：リエージュワッフル、ブレンドコーヒー")
+                # clear_on_submit=True で保存完了時に枠内を空にする
+                with st.form("save_recipe_form", clear_on_submit=True):
+                    recipe_name = st.text_input("レシピ名を入力して保存")
                     save_recipe_btn = st.form_submit_button("この計算結果をスプレッドシートに保存")
                     
                     if save_recipe_btn and recipe_name:
-                        # 使用した材料を文字列にまとめる (例: 小麦粉(100g), 砂糖(50g))
                         ingredients_str = ", ".join([f"{k}({v})" for k, v in used_amounts.items()])
                         
                         new_recipe = pd.DataFrame([{
@@ -156,15 +204,22 @@ with tab2:
                         conn.update(worksheet="Recipes", data=updated_recipes)
                         
                         st.cache_data.clear()
-                        st.success(f"「{recipe_name}」を保存しました！「レシピ一覧」タブで確認できます。")
+                        st.success(f"「{recipe_name}」を保存しました！")
 
 # ==========================================
-# タブ3: 保存済みのレシピ一覧
+# タブ3: レシピの確認と編集
 # ==========================================
 with tab3:
-    st.header("保存済みのレシピ一覧")
+    st.header("保存済みのレシピの編集・削除")
     
     if df_recipes.empty:
-        st.info("まだ保存されたレシピはありません。「原価計算」タブから結果を保存してください。")
+        st.info("まだ保存されたレシピはありません。")
     else:
-        st.dataframe(df_recipes, use_container_width=True)
+        st.write("表を直接クリックして名前や内容を修正できます。不要な行は左端を選んで「Delete」キーで削除できます。")
+        edited_recipes = st.data_editor(df_recipes, num_rows="dynamic", use_container_width=True, key="edit_recipes")
+        
+        if st.button("レシピの変更をスプレッドシートに上書き保存する"):
+            conn.update(worksheet="Recipes", data=edited_recipes)
+            st.cache_data.clear()
+            st.success("レシピの変更を保存しました！")
+            st.rerun()
